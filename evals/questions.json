@@ -1,0 +1,17 @@
+[
+  {
+    "id": "diligence-spatial-ai",
+    "question": "Evaluate the competitive moat and market timing for AI-native generative floor plan startups in US residential homebuilding.",
+    "provider": "gemini",
+    "max_tokens": 50000,
+    "max_searches": 25
+  },
+  {
+    "id": "diligence-serverless-workers",
+    "question": "Compare Cloud Run Worker Pools vs. AWS Bedrock AgentCore for long-running durable AI agent execution.",
+    "provider": "anthropic",
+    "max_tokens": 50000,
+    "max_searches": 25
+  }
+]
+

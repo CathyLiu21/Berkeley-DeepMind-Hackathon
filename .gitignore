@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Terraform state can contain sensitive values — never commit it.
+# Glob every state variant: Terraform writes timestamped backups
+# (terraform.tfstate.<epoch>.backup) that an exact-name rule does not catch.
+terraform/.terraform/
+# .terraform.lock.hcl is deliberately NOT ignored: it pins provider versions,
+# and this stack REQUIRES google ~> 7.x (Worker Pools do not exist in 4.x).
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.auto.tfvars
+
+# Large locally-built CLI binaries (see `make cli`)
+bin/
+
+# Local secrets for development — GEMINI_API_KEY lives here so it is
+# never a shell-history entry or a Terraform value. In production on Cloud Run,
+# Gemini authenticates via Vertex AI ADC (or Secret Manager in terraform/secrets.tf).
+.env
+.pytest_cache/

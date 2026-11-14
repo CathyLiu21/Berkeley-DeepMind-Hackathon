@@ -1,0 +1,1105 @@
+"""The web tier — the single-page research console.
+
+Runs on a Cloud Run **Service**, not a Worker Pool: it is a Temporal *client* that
+starts Workflows, reads Queries and sends Signals. Same image as the Worker, with
+the command overridden to uvicorn.
+
+MUST NOT import `research_workflow`, `llm`, `google.genai` or `anthropic`. Workflows
+are started, queried and signalled by NAME STRING so the web process needs no model
+key.
+Enforced by tests/test_serverless_contract.py.
+
+The Serverless Workers count is `DescribeTaskQueue` poller identities — one Worker
+per Cloud Run instance, so distinct identities IS the count. One source rather than
+the Cloud Run Admin API so the number is produced identically locally and on stage.
+Known tradeoff: poller entries age out over ~5 minutes, so the count lags scale-IN
+while scale-out is immediate.
+
+There is deliberately no chaos/scale endpoint — that would need Cloud Run write
+permission on a page anyone in the room can POST to.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import io
+import json
+import logging
+import os
+import re
+import secrets
+import time
+import uuid
+import wave
+from datetime import timedelta
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi import Path as PathParam
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from temporalio.api.enums.v1 import TaskQueueType
+from temporalio.api.taskqueue.v1 import TaskQueue
+from temporalio.api.workflowservice.v1 import DescribeTaskQueueRequest
+from temporalio.client import Client
+from temporalio.service import RPCError, RPCStatusCode
+
+logger = logging.getLogger("web")
+
+WORKFLOW_NAME = "ResearchWorkflow"
+NARRATE_WORKFLOW_NAME = "NarrateWorkflow"
+STATIC = Path(__file__).parent / "web"
+
+ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
+NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
+TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "research-queue")
+
+# Guards on a page anyone in the room can reach. A question starts a Workflow that
+# spends money, so both of these are load-bearing rather than hygiene.
+MAX_QUESTION_CHARS = 500
+ASKS_PER_MINUTE_PER_IP = 3
+# Shared passcode announced from the stage. Unset means open.
+# CASE-INSENSITIVE on purpose: phone keyboards auto-capitalise the first letter, so a
+# case-sensitive check rejects most of the room on their first try.
+DEMO_PASSCODE = os.environ.get("DEMO_PASSCODE", "").strip()
+# The chaos panel's "cut network" button. OFF unless the process is started with FLEET_CHAOS=1,
+# which only `fleet run --chaos` does. Terraform never sets it, so the deployed web tier has no
+# such endpoint (guarded by test_the_deployed_web_tier_never_enables_chaos).
+CHAOS_ENABLED = os.environ.get("FLEET_CHAOS", "") == "1"
+# Must equal llm.DEFAULT_PROVIDER (web.py cannot import llm); test_web pins the pair.
+DEFAULT_PROVIDER = "anthropic"
+PROVIDERS = frozenset({"gemini", "anthropic"})
+DEFAULT_BUDGET_PROFILE = "standard"
+BUDGET_PRESETS: dict[str, dict[str, int]] = {
+    "lean": {"max_subquestions": 3, "max_tokens": 120_000, "max_searches": 20},
+    "standard": {"max_subquestions": 6, "max_tokens": 350_000, "max_searches": 45},
+    "deep": {"max_subquestions": 6, "max_tokens": 700_000, "max_searches": 80},
+}
+
+
+def _passcode_ok(supplied: str | None) -> bool:
+    if not DEMO_PASSCODE:
+        return True
+    if not isinstance(supplied, str):  # a JSON number or null must read as wrong, not crash
+        supplied = ""
+    # compare_digest, not `==`. The timing signal on a short shared passcode over
+    # HTTPS is not a practical attack, but this is a public repo people copy from and
+    # `==` on a secret is the wrong thing to hand them.
+    return secrets.compare_digest(
+        (supplied or "").strip().casefold(), DEMO_PASSCODE.casefold()
+    )
+
+app = FastAPI(title="Durable AI Deep Research Agent")
+
+_client: Client | None = None
+_asks: dict[str, list[float]] = {}
+_tts_cache: dict[str, bytes] = {}
+TTS_CACHE_MAX = 64
+TTS_MAX_CHARS = 1200
+TTS_CHUNK_CHARS = 280
+_trace_cache: dict[str, tuple[float, dict]] = {}
+TRACE_TTL_SECONDS = 1.5
+
+# Derived from watching the live number change; resets on restart, which is the right
+# scope for a demo.
+_peak_workers = 0
+_total_started = 0
+_last_workers = 0
+
+# Memo for /api/fleet. Every phone renders the counter and each uncached read costs
+# 3 RPCs, so 20 phones would be ~30 RPC/s against a single-VM Temporal — enough to
+# degrade the thing the counter displays. The LOCK matters: without it N concurrent
+# requests on a cold cache all miss and all fan out, which is the stampede this
+# exists to prevent.
+_fleet_cache: dict | None = None
+_fleet_cached_at = 0.0
+_fleet_lock = asyncio.Lock()
+FLEET_TTL_SECONDS = 1.0
+
+
+# Last good `progress` state of runs PARKED at human review. A parked run changes only when
+# a Signal arrives, and the only Signal source here is /decision (or the 2h review
+# timeout), so its state can be served without a Query. That matters on AgentCore: a Query
+# needs a live Worker, sessions drain after ~60s idle, and every page view after that
+# cold-started one (measured 5.7s, versus 0.3s warm). Bounded so a long-lived process
+# cannot grow without limit. Only `awaiting_review` states are cached: a running run's
+# numbers move, and serving them stale would show a frozen progress bar.
+REVIEW_CACHE_TTL_SECONDS = 120.0
+REVIEW_CACHE_MAX = 256
+_review_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _review_cache_get(workflow_id: str) -> dict | None:
+    hit = _review_cache.get(workflow_id)
+    if hit is None:
+        return None
+    stored_at, state = hit
+    if time.monotonic() - stored_at > REVIEW_CACHE_TTL_SECONDS:
+        _review_cache.pop(workflow_id, None)
+        return None
+    return state
+
+
+def _review_cache_put(workflow_id: str, state: dict) -> None:
+    if not state.get("awaiting_review"):
+        _review_cache.pop(workflow_id, None)
+        return
+    if len(_review_cache) >= REVIEW_CACHE_MAX and workflow_id not in _review_cache:
+        oldest = min(_review_cache, key=lambda k: _review_cache[k][0])
+        _review_cache.pop(oldest, None)
+    _review_cache[workflow_id] = (time.monotonic(), state)
+
+
+async def temporal() -> Client:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("TEMPORAL_API_KEY") or None
+        tls = os.environ.get(
+            "TEMPORAL_TLS", "true" if api_key else "false"
+        ).strip().lower() == "true"
+        logger.info("connecting to %s ns=%s tls=%s", ADDRESS, NAMESPACE, tls)
+        _client = await Client.connect(
+            ADDRESS, namespace=NAMESPACE, api_key=api_key, tls=tls
+        )
+    return _client
+
+
+# Which X-Forwarded-For entry is the caller, counted from the END. Google's front end
+# APPENDS, so leading entries are attacker-chosen and only the tail is trustworthy.
+# Direct *.run.app appends just the client, so 1. Behind an external load balancer it
+# appends `<client>, <LB IP>`, so set 2 — otherwise the whole room shares one bucket.
+XFF_HOPS_FROM_END = int(os.environ.get("XFF_HOPS_FROM_END", "1"))
+
+# Only trust the header where a proxy adds it (Cloud Run sets K_SERVICE). Locally it
+# is pure client input. Also needs uvicorn --no-proxy-headers, which otherwise
+# rewrites request.client from the forged first entry.
+_TRUST_XFF = bool(os.environ.get("K_SERVICE"))
+
+
+def _client_ip(request: Request) -> str:
+    """The attendee's IP, for rate-limiting only.
+
+    Never the FIRST X-Forwarded-For entry: that is whatever the caller typed, and
+    rotating it defeats the limit entirely. See XFF_HOPS_FROM_END above.
+    """
+    if _TRUST_XFF:
+        hops = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",")]
+        hops = [h for h in hops if h]
+        if len(hops) >= XFF_HOPS_FROM_END:
+            return hops[-XFF_HOPS_FROM_END]
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limited(ip: str) -> bool:
+    """Per-IP ask limit.
+
+    In-memory, so it is per-instance rather than global — imperfect if the Service
+    scales out, and adequate because the ceiling that actually bounds spend is
+    `max_instances` on the Worker Pool.
+
+    `_asks` is swept of stale buckets on every call. It used to only prune
+    timestamps *within* a bucket and never remove keys, so a request stream with a
+    varying client address grew it without limit until the instance was OOM-killed.
+    """
+    now = time.monotonic()
+    for stale in [k for k, v in _asks.items() if not v or now - v[-1] > 60]:
+        del _asks[stale]
+
+    recent = [t for t in _asks.get(ip, []) if now - t < 60]
+    if len(recent) >= ASKS_PER_MINUTE_PER_IP:
+        _asks[ip] = recent
+        return True
+    recent.append(now)
+    _asks[ip] = recent
+    return False
+
+
+# Wrong-passcode throttle. The passcode is a short shared word, so without this the check
+# itself is a guessing oracle: `_rate_limited` only counts accepted asks and never sees a
+# wrong code. After BAD_PASSCODES_PER_MINUTE wrong tries from one address, even the right
+# code is refused until the window clears.
+BAD_PASSCODES_PER_MINUTE = 10
+_bad_passcodes: dict[str, list[float]] = {}
+
+
+def _recent_bad_passcodes(ip: str) -> list[float]:
+    now = time.monotonic()
+    for stale in [k for k, v in _bad_passcodes.items() if not v or now - v[-1] > 60]:
+        del _bad_passcodes[stale]
+    return [t for t in _bad_passcodes.get(ip, []) if now - t < 60]
+
+
+def _passcode_locked_out(request: Request) -> bool:
+    return len(_recent_bad_passcodes(_client_ip(request))) >= BAD_PASSCODES_PER_MINUTE
+
+
+def _wrong_passcode(request: Request) -> HTTPException:
+    """The error for a refused passcode, recording the failure for the throttle."""
+    ip = _client_ip(request)
+    if _passcode_locked_out(request):
+        return HTTPException(status_code=429, detail="Too many wrong codes. Wait a minute.")
+    _bad_passcodes[ip] = _recent_bad_passcodes(ip) + [time.monotonic()]
+    return HTTPException(status_code=403, detail="Wrong passcode.")
+
+
+# Run ids this app creates are `research-<10 hex>`. Anything else is not one of ours, and
+# these routes would otherwise Query, describe or Signal ANY Workflow in the Namespace.
+RunId = Annotated[str, PathParam(pattern=r"^research-[0-9a-f]{10}$")]
+
+
+# --------------------------------------------------------------------------
+# API
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/ask")
+async def ask(request: Request) -> dict:
+    body = await request.json()
+    question = (body.get("question") or "").strip()
+    provider = (body.get("provider") or DEFAULT_PROVIDER).strip().lower()
+    budget_profile = (body.get("budget_profile") or DEFAULT_BUDGET_PROFILE).strip().lower()
+
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
+    if not question:
+        raise HTTPException(status_code=400, detail="Ask something first.")
+    if len(question) > MAX_QUESTION_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Keep it under {MAX_QUESTION_CHARS} characters.",
+        )
+    if provider not in PROVIDERS:
+        raise HTTPException(status_code=400, detail="Choose Gemini or Claude.")
+    if budget_profile not in BUDGET_PRESETS:
+        raise HTTPException(status_code=400, detail="Unknown budget profile.")
+
+    if _rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=429, detail="One at a time — give the last one a moment."
+        )
+
+    client = await temporal()
+    workflow_id = f"research-{uuid.uuid4().hex[:10]}"
+    # Started by NAME so this module never imports the research app.
+    await client.start_workflow(
+        WORKFLOW_NAME,
+        {
+            "question": question,
+            "provider": provider,
+            "verify": True,
+            "budget": BUDGET_PRESETS[budget_profile],
+        },
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+    )
+    logger.info("started %s with %s (%s): %r", workflow_id, provider, budget_profile, question[:80])
+    return {"id": workflow_id, "provider": provider, "budget_profile": budget_profile}
+
+
+def _split_tts_chunks(text: str, max_chars: int = TTS_CHUNK_CHARS) -> list[str]:
+    """Split text at sentence/word boundaries so every Temporal TTS payload stays well under 2 MB."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    chunks: list[str] = []
+    cur = ""
+    for sent in sentences:
+        if len(sent) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            for word in sent.split():
+                if len(cur) + len(word) + 1 <= max_chars:
+                    cur = f"{cur} {word}".strip()
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    cur = word[:max_chars]
+            continue
+        candidate = f"{cur} {sent}".strip() if cur else sent
+        if len(candidate) <= max_chars:
+            cur = candidate
+        else:
+            chunks.append(cur)
+            cur = sent
+    if cur:
+        chunks.append(cur)
+    return chunks or [text[:max_chars]]
+
+
+def _concat_wavs(wav_chunks: list[bytes]) -> bytes:
+    """Concatenate mono/identical-format WAV chunks into a single seamless WAV."""
+    if len(wav_chunks) == 1:
+        return wav_chunks[0]
+    out = io.BytesIO()
+    params = None
+    with wave.open(out, "wb") as dst:
+        for chunk in wav_chunks:
+            with wave.open(io.BytesIO(chunk), "rb") as src:
+                if params is None:
+                    params = src.getparams()
+                    dst.setparams(params)
+                dst.writeframes(src.readframes(src.getnframes()))
+    return out.getvalue()
+
+
+@app.post("/api/tts")
+async def tts(request: Request) -> Response:
+    body = await request.json()
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Nothing to narrate.")
+
+    snippet = text[:TTS_MAX_CHARS]
+    voice = (body.get("voice") or "Kore").strip()[:32] or "Kore"
+    key = hashlib.sha256(f"{voice}:{snippet}".encode("utf-8")).hexdigest()
+    cached = _tts_cache.get(key)
+    if cached is not None:
+        return Response(content=cached, media_type="audio/wav")
+
+    chunks = _split_tts_chunks(snippet)
+    client = await temporal()
+    workflow_id = f"narrate-{uuid.uuid4().hex[:10]}"
+    try:
+        # Started by NAME so this module never imports the research app.
+        wav_chunks = await asyncio.gather(
+            *(
+                client.execute_workflow(
+                    NARRATE_WORKFLOW_NAME,
+                    args=[chunk, voice],
+                    id=f"{workflow_id}-{idx}",
+                    task_queue=TASK_QUEUE,
+                )
+                for idx, chunk in enumerate(chunks)
+            )
+        )
+    except Exception as exc:
+        logger.warning("tts failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Neural voice unavailable.") from exc
+
+    wav_bytes = _concat_wavs(list(wav_chunks))
+    if len(_tts_cache) >= TTS_CACHE_MAX:
+        _tts_cache.pop(next(iter(_tts_cache)))
+    _tts_cache[key] = wav_bytes
+    return Response(content=wav_bytes, media_type="audio/wav")
+
+
+@app.get("/api/run/{workflow_id}")
+async def run_state(workflow_id: RunId) -> JSONResponse:
+    """The `progress` Query. The only run-state source the page reads.
+
+    404 means "no such run" and NOTHING ELSE. A Query needs a Worker with a free
+    workflow-task slot to answer it, and on this platform there routinely isn't one:
+    the pool sits at zero until the WCI reacts, and during fan-out every instance is
+    busy with a multi-minute research Activity. Those Queries fail with
+    "Timeout expired", which is transient and must read as 503 so the page keeps
+    polling. Mapping every exception to 404 made the page declare healthy runs dead
+    ~30s in — right in the scale-from-zero window the demo is about.
+    """
+    cached = _review_cache_get(workflow_id)
+    if cached is not None:
+        return JSONResponse(cached)
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        state = await handle.query("progress", rpc_timeout=timedelta(seconds=10))
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        if exc.status == RPCStatusCode.FAILED_PRECONDITION:
+            try:
+                desc = await handle.describe()
+                status_name = desc.status.name if desc.status else ""
+                if status_name in ("TERMINATED", "CANCELED", "FAILED", "TIMED_OUT"):
+                    raise HTTPException(
+                        status_code=409, detail=f"Run was {status_name.lower()}."
+                    ) from exc
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        logger.info("query %s unavailable: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Waiting for a worker.") from exc
+    except Exception as exc:
+        logger.info("query %s failed: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Waiting for a worker.") from exc
+    _review_cache_put(workflow_id, state)
+    return JSONResponse(state)
+
+
+# --------------------------------------------------------------- live activities
+#
+# `/api/run/{id}` is a Query, and a Query needs a live Worker. After a Worker is killed
+# mid-Activity there may be NONE for a while, which is exactly when an audience wants to see
+# what Temporal is doing about it. `DescribeWorkflowExecution` is answered by the Temporal
+# service itself, so it works with zero Workers and carries the retry state: attempt,
+# last failure, worker identity, heartbeat age, next retry time.
+#
+# Seconds without a heartbeat before an Activity is shown as silent. NOT the Worker's beat
+# interval: the SDK throttles heartbeat RPCs to one per ~80% of heartbeat_timeout (48s of the
+# 60s here), so the server-side timestamp of a perfectly healthy Activity is routinely 30-48s
+# old. A 20s threshold flagged every healthy part as silent (seen live). 56s sits just inside
+# the 60s timeout, so "silent" only appears when Temporal is about to give up on it.
+HEARTBEAT_SILENT_SECONDS = 56.0
+ACTIVITIES_TTL_SECONDS = 1.0
+LABELS_MAX_RUNS = 128
+
+_activities_cache: dict[str, tuple[float, dict]] = {}
+# Activity ids are immutable once scheduled, so a label is looked up once per run.
+_labels: dict[str, dict[str, dict]] = {}
+
+
+def _short_failure(message: str | None, limit: int = 160) -> str | None:
+    if not message:
+        return None
+    one_line = " ".join(message.split())
+    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+def _ts_seconds(ts) -> float | None:
+    """Seconds since epoch for a protobuf Timestamp, or None when unset."""
+    if ts is None or (ts.seconds == 0 and ts.nanos == 0):
+        return None
+    return ts.seconds + ts.nanos / 1e9
+
+
+def _has_resumable_checkpoint(details) -> bool:
+    """True only if the last heartbeat carries real progress, not just liveness.
+
+    EVERY heartbeat carries details (the timer beat sends the whole Checkpoint), so
+    "non-empty" says nothing. A Claude Activity has something to resume from only after a
+    pause_turn round completed: `partial_summary` filled and `rounds_done` > 0.
+    """
+    for payload in details.payloads:
+        try:
+            data = json.loads(payload.data)
+        except Exception:
+            continue
+        if isinstance(data, dict) and (data.get("partial_summary") or data.get("rounds_done")):
+            return True
+    return False
+
+
+def describe_pending_activities(pending, labels: dict[str, dict], now: float) -> list[dict]:
+    """Turn raw PendingActivityInfo protos into what the page shows.
+
+    `phase` is derived, not reported by Temporal:
+      queued     first attempt, waiting for a Worker
+      running    on a Worker and heartbeating
+      silent     on a Worker but no heartbeat for HEARTBEAT_SILENT_SECONDS: the Worker may
+                 be gone, and Temporal will say so when the heartbeat timeout fires
+      retry_wait attempt > 1 and inside the retry backoff
+      retrying   attempt > 1, backoff over, waiting for a Worker to pick it up
+    """
+    out = []
+    for pa in pending:
+        started = _ts_seconds(pa.last_started_time) if pa.HasField("last_started_time") else None
+        beat = _ts_seconds(pa.last_heartbeat_time) if pa.HasField("last_heartbeat_time") else None
+        next_at = (
+            _ts_seconds(pa.next_attempt_schedule_time)
+            if pa.HasField("next_attempt_schedule_time")
+            else None
+        )
+        failure = _short_failure(pa.last_failure.message) if pa.HasField("last_failure") else None
+        # PENDING_ACTIVITY_STATE_STARTED == 2: the only state with a Worker holding it.
+        on_worker = int(pa.state) == 2
+        # A retry inherits the PREVIOUS attempt's heartbeat timestamp, so measure from whichever
+        # is newer: this attempt's start or its latest heartbeat. Using the stale one flagged
+        # every freshly restarted part as silent right after the network was restored.
+        last_sign = max(t for t in (beat, started) if t) if (beat or started) else None
+        silent_for = max(0.0, now - last_sign) if on_worker and last_sign else None
+
+        if on_worker:
+            phase = "silent" if silent_for is not None and silent_for >= HEARTBEAT_SILENT_SECONDS else "running"
+        elif pa.attempt > 1:
+            phase = "retry_wait" if next_at and next_at > now else "retrying"
+        else:
+            phase = "queued"
+
+        label = labels.get(pa.activity_id, {})
+        out.append(
+            {
+                "activity_id": pa.activity_id,
+                "type": pa.activity_type.name,
+                "index": label.get("index"),
+                "text": label.get("text"),
+                "phase": phase,
+                "attempt": pa.attempt,
+                "worker": pa.last_worker_identity or None,
+                "last_failure": failure,
+                # An abrupt Worker loss surfaces as a heartbeat timeout on the NEXT attempt's
+                # `last_failure`, which is the clearest "a Worker died" signal Temporal gives.
+                "worker_lost": bool(failure and "heartbeat" in failure.lower()),
+                # The console's own fault injection, so the page can say "network down" and
+                # not "worker lost" for what it caused.
+                "outage": bool(failure and "simulated network outage" in failure.lower()),
+                # Heartbeat details persist across attempts: non-empty means the retry has a
+                # checkpoint to resume from (Claude only; Gemini heartbeats carry liveness).
+                "has_checkpoint": _has_resumable_checkpoint(pa.heartbeat_details),
+                "silent_for": None if silent_for is None else round(silent_for, 1),
+                "retry_in": round(next_at - now, 1) if next_at and next_at > now else None,
+            }
+        )
+    out.sort(key=lambda a: (a["index"] is None, a["index"] if a["index"] is not None else 0, a["activity_id"]))
+    return out
+
+
+async def _activity_labels(client: Client, handle, workflow_id: str, wanted: set[str]) -> dict[str, dict]:
+    """activity_id -> {index, text} for research sub-questions, read from the history once."""
+    known = _labels.get(workflow_id)
+    if known is None:
+        if len(_labels) >= LABELS_MAX_RUNS:
+            _labels.pop(next(iter(_labels)), None)
+        known = _labels[workflow_id] = {}
+    if wanted <= known.keys():
+        return known
+    try:
+        async for event in handle.fetch_history_events():
+            if not event.HasField("activity_task_scheduled_event_attributes"):
+                continue
+            attrs = event.activity_task_scheduled_event_attributes
+            if attrs.activity_id in known:
+                continue
+            label: dict = {}
+            if attrs.activity_type.name == "research_subquestion":
+                try:
+                    args = await client.data_converter.decode(attrs.input.payloads)
+                    sub = args[0] if args else {}
+                    label = {"index": sub.get("index"), "text": sub.get("text")}
+                except Exception as exc:  # a label is a nicety; never fail the page for one
+                    logger.info("could not decode activity input for %s: %s", workflow_id, exc)
+            known[attrs.activity_id] = label
+            if wanted <= known.keys():
+                break
+    except Exception as exc:
+        logger.info("history read for labels failed for %s: %s", workflow_id, exc)
+    return known
+
+
+@app.get("/api/run/{workflow_id}/activities")
+async def run_activities(workflow_id: RunId) -> JSONResponse:
+    """What Temporal itself says is in flight, with no Worker needed.
+
+    404 means no such run; anything else transient is 503, same contract as `/api/run/{id}`.
+    """
+    now_mono = time.monotonic()
+    hit = _activities_cache.get(workflow_id)
+    if hit is not None and now_mono - hit[0] < ACTIVITIES_TTL_SECONDS:
+        return JSONResponse(hit[1])
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        desc = await handle.describe()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    except Exception as exc:
+        logger.info("describe %s failed: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+
+    pending = list(desc.raw_description.pending_activities)
+    labels = await _activity_labels(client, handle, workflow_id, {pa.activity_id for pa in pending}) if pending else {}
+    payload = {
+        "status": desc.status.name if desc.status else "UNKNOWN",
+        "activities": describe_pending_activities(pending, labels, time.time()),
+    }
+    _activities_cache[workflow_id] = (now_mono, payload)
+    if len(_activities_cache) > REVIEW_CACHE_MAX:
+        _activities_cache.pop(min(_activities_cache, key=lambda k: _activities_cache[k][0]), None)
+    return JSONResponse(payload)
+
+
+def _event_epoch(event) -> float | None:
+    if hasattr(event, "event_time") and event.event_time.seconds:
+        return event.event_time.ToDatetime().timestamp()
+    return None
+
+
+def _build_trace_from_events(
+    events: list,
+    workflow_id: str,
+    status_name: str,
+    run_id: str,
+    labels: dict[str, dict],
+    now_epoch: float,
+) -> dict:
+    """Build a Waterfall execution trace straight from Temporal's Event History."""
+    t0: float | None = None
+    end_t: float | None = None
+    spans_by_sched: dict[int, dict] = {}
+    signals: list[dict] = []
+    workers: set[str] = set()
+    retries = 0
+
+    for ev in events:
+        ts = _event_epoch(ev)
+        if t0 is None and ts is not None:
+            t0 = ts
+        base_t = t0 or ts or now_epoch
+
+        if ev.HasField("activity_task_scheduled_event_attributes"):
+            attrs = ev.activity_task_scheduled_event_attributes
+            lbl = labels.get(attrs.activity_id) or {}
+            sub_idx = lbl.get("index")
+            name = attrs.activity_type.name
+            display = f"{name} #{sub_idx + 1}" if isinstance(sub_idx, int) else name
+            spans_by_sched[ev.event_id] = {
+                "span_id": attrs.activity_id,
+                "name": display,
+                "activity_type": name,
+                "detail": (lbl.get("text") or "")[:90],
+                "status": "queued",
+                "attempt": 1,
+                "worker": "",
+                "error": "",
+                "_sched_ts": ts or base_t,
+                "_first_start_ts": None,
+                "_last_start_ts": None,
+                "_end_ts": None,
+            }
+        elif ev.HasField("activity_task_started_event_attributes"):
+            attrs = ev.activity_task_started_event_attributes
+            span = spans_by_sched.get(attrs.scheduled_event_id)
+            if span is not None:
+                if span["_first_start_ts"] is None and ts is not None:
+                    span["_first_start_ts"] = ts
+                if ts is not None:
+                    span["_last_start_ts"] = ts
+                span["attempt"] = max(span["attempt"], int(attrs.attempt or 1))
+                if span["attempt"] > 1:
+                    retries += 1
+                worker_id = attrs.identity or ""
+                if worker_id:
+                    span["worker"] = worker_id
+                    workers.add(worker_id)
+                span["status"] = "running"
+        elif ev.HasField("activity_task_completed_event_attributes"):
+            attrs = ev.activity_task_completed_event_attributes
+            span = spans_by_sched.get(attrs.scheduled_event_id)
+            if span is not None:
+                span["status"] = "completed"
+                span["_end_ts"] = ts
+        elif ev.HasField("activity_task_failed_event_attributes"):
+            attrs = ev.activity_task_failed_event_attributes
+            span = spans_by_sched.get(attrs.scheduled_event_id)
+            if span is not None:
+                span["status"] = "failed"
+                span["_end_ts"] = ts
+                if attrs.HasField("failure") and attrs.failure.message:
+                    span["error"] = attrs.failure.message[:160]
+        elif ev.HasField("activity_task_timed_out_event_attributes"):
+            attrs = ev.activity_task_timed_out_event_attributes
+            span = spans_by_sched.get(attrs.scheduled_event_id)
+            if span is not None:
+                span["status"] = "timed_out"
+                span["_end_ts"] = ts
+                if attrs.HasField("failure") and attrs.failure.message:
+                    span["error"] = attrs.failure.message[:160]
+        elif ev.HasField("activity_task_canceled_event_attributes"):
+            attrs = ev.activity_task_canceled_event_attributes
+            span = spans_by_sched.get(attrs.scheduled_event_id)
+            if span is not None:
+                span["status"] = "canceled"
+                span["_end_ts"] = ts
+        elif ev.HasField("workflow_execution_signaled_event_attributes"):
+            attrs = ev.workflow_execution_signaled_event_attributes
+            signals.append(
+                {
+                    "name": attrs.signal_name,
+                    "offset_ms": round(max(0.0, ((ts or base_t) - base_t) * 1000)),
+                }
+            )
+        elif (
+            ev.HasField("workflow_execution_completed_event_attributes")
+            or ev.HasField("workflow_execution_failed_event_attributes")
+            or ev.HasField("workflow_execution_terminated_event_attributes")
+            or ev.HasField("workflow_execution_timed_out_event_attributes")
+        ):
+            end_t = ts
+
+    origin = t0 or now_epoch
+    wf_end = end_t or now_epoch
+    elapsed_ms = round(max(0.0, (wf_end - origin) * 1000))
+
+    spans: list[dict] = []
+    for sched_id in sorted(spans_by_sched):
+        sp = spans_by_sched[sched_id]
+        sched_ts = sp["_sched_ts"]
+        first_start = sp["_first_start_ts"]
+        last_start = sp["_last_start_ts"]
+        close_ts = sp["_end_ts"] or (now_epoch if sp["status"] in ("running", "queued") else last_start or sched_ts)
+        start_ms = round(max(0.0, (sched_ts - origin) * 1000))
+        queue_ms = (
+            round(max(0.0, (first_start - sched_ts) * 1000))
+            if first_start is not None
+            else round(max(0.0, (close_ts - sched_ts) * 1000))
+        )
+        run_ms = (
+            round(max(0.0, (close_ts - first_start) * 1000))
+            if first_start is not None
+            else 0
+        )
+        spans.append(
+            {
+                "span_id": sp["span_id"],
+                "name": sp["name"],
+                "activity_type": sp["activity_type"],
+                "detail": sp["detail"],
+                "status": sp["status"],
+                "attempt": sp["attempt"],
+                "error": sp["error"],
+                "start_ms": start_ms,
+                "queue_ms": queue_ms,
+                "run_ms": run_ms,
+            }
+        )
+
+    return {
+        "workflow_id": workflow_id,
+        "run_id": run_id,
+        "status": status_name,
+        "elapsed_ms": elapsed_ms,
+        "event_count": len(events),
+        "worker_count": len(workers),
+        "retries": retries,
+        "signals": signals,
+        "spans": spans,
+    }
+
+
+@app.get("/api/run/{workflow_id}/trace")
+async def run_trace(workflow_id: RunId) -> JSONResponse:
+    """Distributed execution trace distilled from Temporal's Event History."""
+    now_mono = time.monotonic()
+    hit = _trace_cache.get(workflow_id)
+    if hit is not None and (hit[1].get("status") != "RUNNING" or now_mono - hit[0] < TRACE_TTL_SECONDS):
+        return JSONResponse(hit[1])
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        desc = await handle.describe()
+        history = await handle.fetch_history()
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    except Exception as exc:
+        logger.info("trace %s failed: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+
+    events = list(history.events)
+    sched_ids = {
+        ev.activity_task_scheduled_event_attributes.activity_id
+        for ev in events
+        if ev.HasField("activity_task_scheduled_event_attributes")
+    }
+    labels = await _activity_labels(client, handle, workflow_id, sched_ids) if sched_ids else {}
+    status_name = desc.status.name if desc.status else "UNKNOWN"
+    payload = _build_trace_from_events(
+        events,
+        workflow_id,
+        status_name,
+        desc.run_id or "",
+        labels,
+        time.time(),
+    )
+    _trace_cache[workflow_id] = (now_mono, payload)
+    if len(_trace_cache) > REVIEW_CACHE_MAX:
+        _trace_cache.pop(min(_trace_cache, key=lambda k: _trace_cache[k][0]), None)
+    return JSONResponse(payload)
+
+
+@app.post("/api/run/{workflow_id}/network")
+async def cut_network(workflow_id: RunId, request: Request) -> dict:
+    """Chaos panel: cut or restore the model-API route for ONE run.
+
+    It signals the Workflow, which flags its memo; each Activity attempt then fails while the
+    flag is set and Temporal retries it. Nothing here touches a Worker or a network device.
+
+    Disabled (404, indistinguishable from no such route) unless FLEET_CHAOS=1, and passcode
+    guarded like every other action that changes a run.
+    """
+    if not CHAOS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found.")
+    body = await request.json()
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
+    cut = body.get("cut")
+    if not isinstance(cut, bool):
+        raise HTTPException(status_code=400, detail="cut must be true or false")
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    try:
+        await handle.signal("network", cut)
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    # The flag changed what the page should show, so drop anything cached about this run.
+    _activities_cache.pop(workflow_id, None)
+    _review_cache.pop(workflow_id, None)
+    logger.info("network %s for %s", "CUT" if cut else "restored", workflow_id)
+    return {"ok": True, "cut": cut}
+
+
+@app.post("/api/run/{workflow_id}/decision")
+async def decide(workflow_id: RunId, request: Request) -> dict:
+    """Send the review Signal — the event that wakes a pool sitting at zero.
+
+    Guarded exactly like `/api/ask`, because it spends exactly like `/api/ask`: a
+    `refine` decision starts a SECOND fan-out. Without these two checks, knowing a run
+    id was enough to spend Gemini tokens repeatedly, bypassing both the passcode and
+    the per-IP limit. Run ids are `research-<uuid4[:10]>` and there is no listing
+    endpoint, so they are not enumerable — but they are on screen in front of a room.
+    """
+    body = await request.json()
+    decision = (body.get("decision") or "").strip()
+
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
+    if decision not in ("accept", "refine"):
+        raise HTTPException(status_code=400, detail="decision must be accept or refine")
+
+    # Only `refine` costs anything, so only `refine` consumes the budget. Rate-limiting
+    # `accept` would strand a finished run behind a cooldown for no benefit.
+    if decision == "refine" and _rate_limited(_client_ip(request)):
+        raise HTTPException(
+            status_code=429, detail="One at a time — give the last one a moment."
+        )
+
+    note = (body.get("note") or "").strip()[:MAX_QUESTION_CHARS]
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    # The Signal changes the run's state, so a cached "awaiting_review" is now wrong. Drop
+    # it BEFORE signalling: the other order lets a poll in between re-cache the old state.
+    _review_cache.pop(workflow_id, None)
+    await handle.signal("review", args=[decision, note])
+    logger.info("signalled %s: %s", workflow_id, decision)
+    return {"ok": True}
+
+
+@app.post("/api/run/{workflow_id}/stop")
+async def stop_run(workflow_id: RunId, request: Request) -> dict:
+    """Terminate an active Workflow immediately from the web console."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    if _passcode_locked_out(request) or not _passcode_ok(body.get("passcode")):
+        raise _wrong_passcode(request)
+
+    client = await temporal()
+    handle = client.get_workflow_handle(workflow_id)
+    _review_cache.pop(workflow_id, None)
+    _activities_cache.pop(workflow_id, None)
+    _trace_cache.pop(workflow_id, None)
+    try:
+        await handle.terminate(reason="Stopped from web console.")
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            raise HTTPException(status_code=404, detail="No such run.") from exc
+        if exc.status == RPCStatusCode.FAILED_PRECONDITION:
+            logger.info("stop %s already closed: %s", workflow_id, exc)
+            return {"ok": True, "status": "already_stopped"}
+        logger.warning("stop %s failed: %s", workflow_id, exc)
+        raise HTTPException(status_code=503, detail="Temporal unavailable.") from exc
+    logger.info("terminated %s from web console", workflow_id)
+    return {"ok": True, "status": "stopped"}
+
+
+@app.get("/api/fleet")
+async def fleet() -> dict:
+    """The footer's numbers, led by the Serverless Workers count.
+
+    Cached for `FLEET_TTL_SECONDS`. Read the note on `_fleet_cache`: this is read
+    by the whole room, not one projector.
+    """
+    global _fleet_cache, _fleet_cached_at
+
+    now = time.monotonic()
+    if _fleet_cache is not None and now - _fleet_cached_at < FLEET_TTL_SECONDS:
+        return _fleet_cache
+
+    async with _fleet_lock:
+        # Re-check inside the lock: whoever queued behind the refresh should use
+        # its result rather than immediately refreshing again.
+        now = time.monotonic()
+        if _fleet_cache is not None and now - _fleet_cached_at < FLEET_TTL_SECONDS:
+            return _fleet_cache
+        _fleet_cache = await _read_fleet()
+        _fleet_cached_at = time.monotonic()
+        return _fleet_cache
+
+
+async def _read_fleet() -> dict:
+    """The uncached read. Called only from `fleet()` behind the lock.
+
+    The rising-edge derivation for `peak`/`started` lives HERE rather than in the
+    request handler, and that placement is load-bearing: if it ran per request
+    while the value was cached, every cached hit would compare a fresh `workers`
+    against a `_last_workers` that had already been advanced, and `started` would
+    drift. Once per refresh is exactly once per genuine observation.
+    """
+    global _peak_workers, _total_started, _last_workers
+
+    client = await temporal()
+
+    identities: set[str] = set()
+    backlog = 0
+    ok = False
+    for queue_type in (
+        TaskQueueType.TASK_QUEUE_TYPE_WORKFLOW,
+        TaskQueueType.TASK_QUEUE_TYPE_ACTIVITY,
+    ):
+        try:
+            resp = await client.workflow_service.describe_task_queue(
+                DescribeTaskQueueRequest(
+                    namespace=NAMESPACE,
+                    task_queue=TaskQueue(name=TASK_QUEUE),
+                    task_queue_type=queue_type,
+                    report_stats=True,
+                )
+            )
+        except Exception as exc:
+            logger.warning("describe_task_queue(%s) failed: %s", queue_type, exc)
+            continue
+        ok = True
+        # One Worker polls both queue types with the same identity, so the union of
+        # identities is the Worker count rather than double it.
+        identities.update(p.identity for p in resp.pollers)
+        stats = getattr(resp, "stats", None)
+        if stats is not None:
+            # What the Worker Controller itself reacts to. Only populated when the
+            # server supports report_stats; treated as best-effort.
+            backlog = max(backlog, getattr(stats, "approximate_backlog_count", 0) or 0)
+
+    # A failed RPC is NOT a scale-to-zero. Treating it as `workers = 0` also poisoned
+    # `_last_workers`, so the next good poll saw a false rising edge and permanently
+    # inflated `started`. Keep the last good observation.
+    if not ok:
+        if _fleet_cache is not None:
+            return _fleet_cache
+        workers = _last_workers
+    else:
+        workers = len(identities)
+
+        # Rising edges give cumulative starts; no persistence needed.
+        if workers > _last_workers:
+            _total_started += workers - _last_workers
+    _last_workers = workers
+    _peak_workers = max(_peak_workers, workers)
+
+    try:
+        running = (
+            await client.count_workflows(
+                f"WorkflowType = '{WORKFLOW_NAME}' AND ExecutionStatus = 'Running'"
+            )
+        ).count
+    except Exception as exc:
+        logger.warning("count_workflows failed: %s", exc)
+        running = -1
+
+    return {
+        "workers": workers,
+        "peak": _peak_workers,
+        "started": _total_started,
+        "workflows_running": running,
+        "backlog": backlog,
+        "task_queue": TASK_QUEUE,
+        # Set by `fleet run`; empty when the console was started some other way.
+        "target": os.environ.get("FLEET_TARGET", ""),
+        "namespace": NAMESPACE,
+        "chaos": CHAOS_ENABLED,
+        "passcode_required": bool(DEMO_PASSCODE),
+    }
+
+
+# No `/api/runs`, deliberately. Run ids are `research-<uuid4 hex>`, so /api/run/{id}
+# is capability-based; listing those ids on a public Service would make every
+# attendee's question readable by a stranger. `temporal workflow list` does the job.
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# The page — one HTML file, one stylesheet, self-hosted fonts. No build step.
+# --------------------------------------------------------------------------
+
+
+def _fresh(resp: FileResponse) -> FileResponse:
+    """Force revalidation on the files that change between deploys.
+
+    FileResponse sends ETag and Last-Modified but no Cache-Control, and browsers
+    then apply *heuristic* freshness — they may serve a stale copy without asking.
+    A phone that loaded the page before a redeploy would keep the old UI for the
+    rest of the talk. The ETag still makes the revalidation a cheap 304.
+
+    Not applied to the fonts or the logo: those are large, and they only change when
+    the brand does.
+    """
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/")
+@app.get("/r/{workflow_id}")
+async def index(workflow_id: str = "") -> FileResponse:
+    """The console. `/r/{id}` is the resumable form.
+
+    The resumable URL is what makes the review pause work at all: the attendee
+    closes the tab, goes for coffee, reopens the link, and the draft is still
+    there — because it lives in Temporal, not in the page.
+
+    There is no separate presenter page any more. This one carries the fleet
+    counters in its footer and scales them with the viewport, so the same URL
+    serves a phone in a seat and a projector at the front of the room.
+    """
+    return _fresh(FileResponse(STATIC / "index.html"))
+
+
+@app.get("/app.css")
+async def stylesheet() -> FileResponse:
+    return _fresh(FileResponse(STATIC / "app.css", media_type="text/css"))
+
+
+@app.get("/temporal-logo.svg")
+async def logo() -> FileResponse:
+    """The official horizontal lockup, light variant, from temporal.io/brand."""
+    return FileResponse(STATIC / "temporal-logo.svg", media_type="image/svg+xml")
+
+
+# The Learn cards, served as raw markdown for the page to render into a dialog.
+#
+# `learn/README.md` is the single source of truth — it is a real document people read
+# on GitHub, and duplicating it into the page would guarantee the two drift. It lives
+# OUTSIDE `web/`, so it needs both this route and its own `COPY` in the Dockerfile;
+# shipping it and serving it are separate problems and missing either one produces a
+# modal that works locally and 404s on Cloud Run.
+LEARN_MD = Path(__file__).parent / "learn" / "README.md"
+
+
+@app.get("/api/learn")
+async def learn() -> FileResponse:
+    if not LEARN_MD.exists():
+        raise HTTPException(status_code=404, detail="Learn cards are not installed.")
+    return _fresh(FileResponse(LEARN_MD, media_type="text/markdown; charset=utf-8"))
+
+
+# Self-hosted fonts. A mount rather than a route per file, because there are
+# several plus their OFL licences. They must be SERVED as well as shipped —
+# `COPY web/ ./web/` puts them in the image, but nothing would hand them out
+# without this, and the page would silently fall back to system type.
+app.mount("/fonts", StaticFiles(directory=STATIC / "fonts"), name="fonts")

@@ -4,7 +4,7 @@ A multi-agent due diligence and market research workbench powered by **Gemini 3.
 
 ## Demo Videos
 
-- **2-Minute Video — Team Introduction & Elevator Pitch:** https://youtu.be/BViIUzQXxIs
+- **2-Minute Video — Team Introduction & Elevator Pitch (Solo Team — Cathy Liu / Team Gemini Fleet):** https://youtu.be/BViIUzQXxIs
 - **1-Minute Video — Prototype Demo (Critical User Journey):** https://youtu.be/YcfgTGyPi8U
 
 ## What This App Does

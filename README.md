@@ -2,6 +2,11 @@
 
 A multi-agent due diligence and market research workbench powered by **Gemini 3.6 Flash + Google Search Grounding**, **Gemini TTS (`gemini-2.5-flash-preview-tts`)**, **Vertex AI**, **Google Cloud Run Services & Worker Pools**, and **Temporal** — built for the **Berkeley x DeepMind Hackathon**.
 
+## Demo Videos
+
+- **2-Minute Video — Team Introduction & Elevator Pitch:** https://youtu.be/BViIUzQXxIs
+- **1-Minute Video — Prototype Demo (Critical User Journey):** https://youtu.be/YcfgTGyPi8U
+
 ## What This App Does
 
 1. **Ask & Budget Guardrail:** Submit a startup, market, or technical question with a selectable **Lean** (`3 parts · 120k tok`), **Standard** (`6 parts · 350k tok`), or **Deep** (`6 parts · 700k tok`) budget guardrail.
